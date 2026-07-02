@@ -23,6 +23,12 @@ Changelog:
   1.0 - initial implementation
   1.1 - added functionality for vMotion check
   1.2 - added --version parameter and minor refactoring
+  1.3 - vmotion: deduplicate events/tasks via event chain ID to prevent 
+        double counting; only count completed tasks; fixed breakdown keys
+  1.4 - vmotion: filter events server-side via eventTypeId; fixes sporadic
+        UNKNOWN caused by pyVmomi failing to deserialize unrelated event
+        types (e.g. KeyError 'ContentLibraryItem' from Content Library
+        events); also reduces query load
 """
 
 import argparse
@@ -38,7 +44,7 @@ except ImportError:
     sys.exit(3)
 
 
-VERSION = "1.2"
+VERSION = "1.4"
 
 # ---------------------------------------------------------------------------
 # Icinga/Nagios exit codes
@@ -171,16 +177,15 @@ def collect_all_events(event_mgr, filter_spec):
 
 def collect_migration_tasks(content, start, end, cluster_vm_refs=None):
     """
-    Query the task manager for manually triggered migrations.
-
-    In vSphere 8 a manual compute+storage migration (relocate) is recorded
-    ONLY as a task (VirtualMachine.relocate / VirtualMachine.migrate) and
-    does NOT produce a migration event. DRS migrations still go to the event
-    system. We therefore query both and combine the counts.
+    Query the task manager for migration tasks (manual or DRS-triggered).
 
     Task descriptionIds for migrations:
-      VirtualMachine.relocate  - manual combined compute+storage vMotion
-      VirtualMachine.migrate   - manual compute-only vMotion (older behavior)
+      VirtualMachine.relocate  - combined compute+storage vMotion
+      VirtualMachine.migrate   - compute-only vMotion
+
+    Only tasks in state 'success' are collected. Running tasks are skipped
+    on purpose: they would be counted now AND again in the next check run
+    once their completion event lands in the event system.
     """
     MIGRATION_TASK_IDS = {"VirtualMachine.relocate", "VirtualMachine.migrate"}
 
@@ -190,7 +195,7 @@ def collect_migration_tasks(content, start, end, cluster_vm_refs=None):
             beginTime=start,
             endTime=end,
         ),
-        state=[vim.TaskInfo.State.success, vim.TaskInfo.State.running],
+        state=[vim.TaskInfo.State.success],
     )
 
     try:
@@ -211,23 +216,35 @@ def collect_migration_tasks(content, start, end, cluster_vm_refs=None):
         if t.descriptionId not in MIGRATION_TASK_IDS:
             continue
         if cluster_vm_refs is not None:
-            if not hasattr(t, "entity") or t.entity._moId not in cluster_vm_refs:
+            if not hasattr(t, "entity") or t.entity is None \
+               or t.entity._moId not in cluster_vm_refs:
                 continue
         result.append(t)
     return result
-
 
 def check_vmotion(si, args):
     """
     Count vMotion migrations in the last --window hours.
     If --cluster is given, only migrations for VMs in that cluster are counted.
-    Raises WARNING/CRITICAL if the count exceeds thresholds.
 
-    vSphere 8 records migrations in two separate systems:
-      - DRS-triggered migrations  --> event system (DrsVmMigratedEvent)
-      - Manual migrations         --> task system  (VirtualMachine.relocate)
-      - Encrypted VM migrations   --> EventEx      (VmHotMigratingWithEncryptionEvent)
-    All three sources are queried and combined into a single count.
+    A single migration can appear in MULTIPLE records:
+      - a task (VirtualMachine.relocate / VirtualMachine.migrate)
+      - a completion event (VmMigratedEvent / VmRelocatedEvent /
+        DrsVmMigratedEvent)
+      - for encrypted VMs additionally an in-progress EventEx
+        (VmHotMigratingWithEncryptionEvent)
+
+    All records of one migration share the same event chain ID
+    (Event.chainId == TaskInfo.eventChainId), which is used here to
+    deduplicate so each migration is counted exactly once.
+
+    Events are filtered SERVER-SIDE via eventTypeId. This is essential:
+    an unfiltered query returns ALL events, including types unknown to
+    the installed pyVmomi version (e.g. Content Library events that
+    reference 'ContentLibraryItem'). Those crash deserialization in
+    ReadNextEvents with a KeyError. Filtering server-side means unknown
+    types are never sent to the client — and drastically reduces the
+    amount of data transferred on busy vCenters.
     """
     window_hours = args.window
     warn  = args.warning
@@ -242,54 +259,80 @@ def check_vmotion(si, args):
 
     cluster_vm_refs = get_cluster_vm_refs(si, cluster_name) if cluster_name else None
 
-    # --- Source 1: event system (DRS + encrypted vMotions) ---
+    # --- Source 1: event system (server-side filtered) ---
+    # Note: eventTypeId does NOT include subclasses automatically,
+    # so DrsVmMigratedEvent must be listed alongside VmMigratedEvent.
+    # Classic events use the plain class name (no vim.event. prefix),
+    # EventEx types use their full eventTypeId string.
+    VMOTION_EVENT_TYPE_IDS = [
+        "VmMigratedEvent",
+        "DrsVmMigratedEvent",
+        "VmRelocatedEvent",
+        "com.vmware.vc.vm.VmHotMigratingWithEncryptionEvent",  # EventEx
+    ]
+
     time_filter = vim.event.EventFilterSpec.ByTime(beginTime=start, endTime=now)
-    filter_spec = vim.event.EventFilterSpec(time=time_filter)
-    all_events  = collect_all_events(event_mgr, filter_spec)
-
-    CLASSIC_VMOTION_TYPES = (
-        vim.event.VmMigratedEvent,
-        vim.event.VmRelocatedEvent,
-        vim.event.DrsVmMigratedEvent,
+    filter_spec = vim.event.EventFilterSpec(
+        time=time_filter,
+        eventTypeId=VMOTION_EVENT_TYPE_IDS,
     )
-    EVENTEX_VMOTION_IDS = {
-        "com.vmware.vc.vm.VmHotMigratingWithEncryptionEvent",
-    }
+    all_events = collect_all_events(event_mgr, filter_spec)
 
-    def is_vmotion_event(e):
-        if isinstance(e, vim.event.EventEx):
-            return getattr(e, "eventTypeId", "") in EVENTEX_VMOTION_IDS
-        return isinstance(e, CLASSIC_VMOTION_TYPES)
-
-    vmotion_events = [e for e in all_events if is_vmotion_event(e)]
+    # Client-side filtering is now just the cluster scope — the server
+    # already filtered by event type.
+    vmotion_events = all_events
     if cluster_vm_refs is not None:
         vmotion_events = [
             e for e in vmotion_events
-            if hasattr(e, "vm") and e.vm.vm._moId in cluster_vm_refs
+            if getattr(e, "vm", None) and e.vm.vm._moId in cluster_vm_refs
         ]
 
-    # --- Source 2: task system (manual relocate/migrate in vSphere 8) ---
+    # --- Source 2: task system ---
     manual_tasks = collect_migration_tasks(vcontent, start, now, cluster_vm_refs)
 
-    # --- Combine and build breakdown ---
-    type_counts = {}
-    for e in vmotion_events:
-        tid = getattr(e, "eventTypeId", None) or type(e).__name__
-        type_counts[tid] = type_counts.get(tid, 0) + 1
-    for t in manual_tasks:
-        type_counts[t.descriptionId] = type_counts.get(t.descriptionId, 0) + 1
+    # --- Deduplicate: one migration = one chain ID ---
+    def classify_event(e):
+        """Return a stable category label for the breakdown."""
+        if isinstance(e, vim.event.EventEx):
+            return "encrypted"
+        # Check subclass BEFORE parent class!
+        if isinstance(e, vim.event.DrsVmMigratedEvent):
+            return "drs"
+        return "classic"
 
-    count = len(vmotion_events) + len(manual_tasks)
+    seen_chains = set()
+    type_counts = {}
+
+    # Events first: they carry more meaning (DRS vs. classic) than the
+    # generic task descriptionId, so let them win the classification.
+    for e in vmotion_events:
+        chain = getattr(e, "chainId", None)
+        if chain is not None and chain in seen_chains:
+            continue
+        if chain is not None:
+            seen_chains.add(chain)
+        cat = classify_event(e)
+        type_counts[cat] = type_counts.get(cat, 0) + 1
+
+    for t in manual_tasks:
+        chain = getattr(t, "eventChainId", None)
+        if chain is not None and chain in seen_chains:
+            continue
+        if chain is not None:
+            seen_chains.add(chain)
+        type_counts["manual"] = type_counts.get("manual", 0) + 1
+
+    count = sum(type_counts.values())
     scope_label = f"cluster '{cluster_name}'" if cluster_name else "all clusters"
     perfdata = (
         f"vmotion_count={count};{warn};{crit};0 "
-        f"vmotion_manual={type_counts.get('VirtualMachine.relocate', 0) + type_counts.get('VirtualMachine.migrate', 0)};; "
-        f"vmotion_drs={type_counts.get('vim.event.DrsVmMigratedEvent', 0)};; "
-        f"vmotion_encrypted={type_counts.get('com.vmware.vc.vm.VmHotMigratingWithEncryptionEvent', 0)};; "
-        f"vmotion_classic={type_counts.get('vim.event.VmMigratedEvent', 0) + type_counts.get('vim.event.VmRelocatedEvent', 0)};;"
+        f"vmotion_manual={type_counts.get('manual', 0)};; "
+        f"vmotion_drs={type_counts.get('drs', 0)};; "
+        f"vmotion_encrypted={type_counts.get('encrypted', 0)};; "
+        f"vmotion_classic={type_counts.get('classic', 0)};;"
     )
 
-    breakdown = ", ".join(f"{k}:{v}" for k, v in type_counts.items()) or "none"
+    breakdown = ", ".join(f"{k}:{v}" for k, v in sorted(type_counts.items())) or "none"
     msg = (f"{count} vMotion(s) in the last {window_hours}h on {scope_label} "
            f"[{breakdown}]")
 
@@ -298,8 +341,7 @@ def check_vmotion(si, args):
     if warn is not None and count >= warn:
         exit_plugin(WARNING, "vmotion", msg, perfdata)
     exit_plugin(OK, "vmotion", msg, perfdata)
-
-
+    
 # ---------------------------------------------------------------------------
 # Check: old snapshots
 # ---------------------------------------------------------------------------
