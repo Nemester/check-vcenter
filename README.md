@@ -307,3 +307,5 @@ Because VMware's `QueryEvents` API is hard-capped at 1000 results, this plugin u
 | 1.0 | Initial implementation (snapshot, host_alarms, host_issues) |
 | 1.1 | Added vMotion check with vSphere 8 support |
 | 1.2 | Added `--version` / `-V` parameter, minor refactoring |
+| 1.3 | vmotion: deduplicate events/tasks via event chain ID to prevent double counting; only count completed tasks; fixed breakdown keys |
+| 1.4 | motion: filter events server-side via eventTypeId; fixes sporadic UNKNOWN caused by pyVmomi failing to deserialize unrelated event types (e.g. KeyError 'ContentLibraryItem' from Content Library events); also reduces query load |
