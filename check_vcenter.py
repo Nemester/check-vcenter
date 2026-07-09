@@ -19,6 +19,9 @@ Usage examples:
 Requirements:
   pip install pyVmomi
 
+Repository:
+  https://github.com/Nemester/check-vcenter
+
 Changelog:
   1.0 - initial implementation
   1.1 - added functionality for vMotion check
